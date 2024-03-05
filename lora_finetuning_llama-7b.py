@@ -1,170 +1,246 @@
 import os
-import random
+import sys
+import fire
 import torch
 import transformers
-from enum import Enum
-from dataclasses import dataclass, field
+import json
+import os.path as osp
+from typing import List, Union
 from datasets import load_dataset
-from typing import Optional
-from dataclass_csv import DataclassReader
-from torch.utils.data import Dataset, DataLoader
-from peft import LoraConfig, get_peft_model
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    TrainingArguments,
-    Trainer,
-    default_data_collator,
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    get_peft_model_state_dict,
+    prepare_model_for_int8_training,
+    set_peft_model_state_dict,
 )
-
-class SpecialTokens(str, Enum):
-    begin_target = "<|begintarget|>"
-    end_target = "<|endtarget|>"
-    begin_context = "<|begincontext|>"
-    end_context = "<|endcontext|>"
-    system = "<|system|>"
-    user = "<|user|>"
-    begin_last_user_utterance = "<|beginlastuserutterance|>"
-    end_last_user_utterance = "<|endlastuserutterance|>"
-    begin_dsts = "<|begindsts|>"
-    end_dsts = "<|enddsts|>"
-    begin_dst = "<|begindst|>"
-    end_dst = "<|enddst|>"
-    begin_belief = "<|beginbelief|>"
-    end_belief = "<|endbelief|>"
-    begin_response = "<|beginresponse|>"
-    end_response = "<|endresponse|>"
-    begin_action = "<|beginaction|>"
-    end_action = "<|endaction|>"
-    begin_user_action = "<|beginuseraction|>"
-    end_user_action = "<|enduseraction|>"
-    sys_actions = "<|sysactions|>"
-    begin_intent = "<|beginintent|>"
-    end_intent = "<|endintent|>"
-    begin_requested_slots = "<|beginrequestedslots|>"
-    end_requested_slots = "<|endrequestedslots|>"
-    pad_token = "<|pad|>"
-    bos_token = "<|startoftext|>"
-
-    @classmethod
-    def list(cls):
-        return [c.value for c in cls]
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-model_name = "meta-llama/Llama-2-7b-chat-hf"
-tokenizer = AutoTokenizer.from_pretrained(
-    model_name,
-    pad_token=SpecialTokens.pad_token.value,
-    bos_token=SpecialTokens.bos_token.value,
-    eos_token=SpecialTokens.end_target.value,
-    additional_special_tokens=SpecialTokens.list(),
-)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    low_cpu_mem_usage=True
-)
-model.resize_token_embeddings(len(tokenizer))
+class Prompter(object):
+    __slots__ = ("template", "_verbose")
 
-config = LoraConfig(
-    r=64, lora_alpha=128, lora_dropout=0.0, target_modules=["embed_tokens", "lm_head", "q_proj", "v_proj"]
-)
-model = get_peft_model(model, config)
-print(model.print_trainable_parameters())
-print(model)
+    def __init__(self, template_name: str = "", verbose: bool = False):
+        self._verbose = verbose
+        if not template_name:
+            # Enforce the default here, so the constructor can be called with '' and will not break.
+            template_name = "alpaca"
+        file_name = f"{template_name}.json"
+        if not osp.exists(file_name):
+            raise ValueError(f"Can't read {file_name}")
+        with open(file_name) as fp:
+            self.template = json.load(fp)
+        if self._verbose:
+            print(
+                f"Using prompt template {template_name}: {self.template['description']}"
+            )
 
-dataset = load_dataset("smangrul/assistant_chatbot_dataset")
-dataset = dataset["train"].train_test_split(0.2)
+    def generate_prompt(
+        self,
+        instruction: str,
+        input: Union[None, str] = None,
+        label: Union[None, str] = None,
+    ) -> str:
+        # returns the full prompt from instruction and optional input
+        # if a label (=response, =output) is provided, it's also appended.
+        if input:
+            res = self.template["prompt_input"].format(
+                instruction=instruction, input=input
+            )
+        else:
+            res = self.template["prompt_no_input"].format(instruction=instruction)
+        if label:
+            res = f"{res}{label}"
+        if self._verbose:
+            print(res)
+        return res
 
-text_column = "context"
-label_column = "target"
-max_length = 512
-
-
-def preprocess_function(examples):
-    batch_size = len(examples[text_column])
-    targets = [str(x) for x in examples[label_column]]
-    model_inputs = tokenizer(examples[text_column])
-    labels = tokenizer(targets, add_special_tokens=False)  # don't add bos token because we concatenate with inputs
-    for i in range(batch_size):
-        sample_input_ids = model_inputs["input_ids"][i]
-        label_input_ids = labels["input_ids"][i] + [tokenizer.eos_token_id]
-        # print(i, sample_input_ids, label_input_ids)
-        model_inputs["input_ids"][i] = sample_input_ids + label_input_ids
-        labels["input_ids"][i] = [-100] * len(sample_input_ids) + label_input_ids
-        model_inputs["attention_mask"][i] = [1] * len(model_inputs["input_ids"][i])
-    # print(model_inputs)
-    for i in range(batch_size):
-        sample_input_ids = model_inputs["input_ids"][i]
-        label_input_ids = labels["input_ids"][i]
-        model_inputs["input_ids"][i] = [tokenizer.pad_token_id] * (
-            max_length - len(sample_input_ids)
-        ) + sample_input_ids
-        model_inputs["attention_mask"][i] = [0] * (max_length - len(sample_input_ids)) + model_inputs[
-            "attention_mask"
-        ][i]
-        labels["input_ids"][i] = [-100] * (max_length - len(sample_input_ids)) + label_input_ids
-        model_inputs["input_ids"][i] = model_inputs["input_ids"][i][:max_length]
-        model_inputs["attention_mask"][i] = model_inputs["attention_mask"][i][:max_length]
-        labels["input_ids"][i] = labels["input_ids"][i][:max_length]
-    model_inputs["labels"] = labels["input_ids"]
-    return model_inputs
+    def get_response(self, output: str) -> str:
+        return output.split(self.template["response_split"])[1].strip()
 
 
-processed_datasets = dataset.map(
-    preprocess_function,
-    batched=True,
-    num_proc=1,
-    remove_columns=dataset["train"].column_names,
-    load_from_cache_file=False,
-    desc="Running tokenizer on dataset",
-)
+def train(
+    # model/data params
+    base_model: str = "meta-llama/Llama-2-7b-chat-hf",
+    data_path: str = "yahma/alpaca-cleaned",
+    output_dir: str = "./lora-alpaca",
+    # training hyperparams
+    batch_size: int = 32,
+    micro_batch_size: int = 4,
+    num_epochs: int = 3,
+    learning_rate: float = 3e-4,
+    cutoff_len: int = 256,
+    val_set_size: int = 2000,
+    # lora hyperparams
+    lora_r: int = 8,
+    lora_alpha: int = 16,
+    lora_dropout: float = 0.05,
+    lora_target_modules: List[str] = [
+        "q_proj",
+        "v_proj",
+    ],
+    # llm hyperparams
+    train_on_inputs: bool = True,  # if False, masks out inputs in loss
+    add_eos_token: bool = False,
+    group_by_length: bool = False,  # faster, but produces an odd training loss curve
+    prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
+):
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        print(
+            f"Training Alpaca-LoRA model with params:\n"
+            f"base_model: {base_model}\n"
+            f"data_path: {data_path}\n"
+            f"output_dir: {output_dir}\n"
+            f"batch_size: {batch_size}\n"
+            f"micro_batch_size: {micro_batch_size}\n"
+            f"num_epochs: {num_epochs}\n"
+            f"learning_rate: {learning_rate}\n"
+            f"cutoff_len: {cutoff_len}\n"
+            f"val_set_size: {val_set_size}\n"
+            f"lora_r: {lora_r}\n"
+            f"lora_alpha: {lora_alpha}\n"
+            f"lora_dropout: {lora_dropout}\n"
+            f"lora_target_modules: {lora_target_modules}\n"
+            f"train_on_inputs: {train_on_inputs}\n"
+            f"add_eos_token: {add_eos_token}\n"
+            f"group_by_length: {group_by_length}\n"
+            f"prompt template: {prompt_template_name}\n"
+        )
+    assert (
+        base_model
+    ), "Please specify a --base_model, e.g. --base_model='huggyllama/llama-7b'"
+    gradient_accumulation_steps = batch_size // micro_batch_size
 
-train_dataset = processed_datasets["train"]
+    prompter = Prompter(prompt_template_name)
 
-# train_dataloader = DataLoader(
-#     train_dataset, shuffle=True, collate_fn=default_data_collator, batch_size=8, pin_memory=True
-# )
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    ddp = world_size != 1
+    if ddp:
+        gradient_accumulation_steps = gradient_accumulation_steps // world_size
 
-training_args = TrainingArguments(
-    output_dir="llama_lora_clm_with_added_tokens",
-    num_train_epochs=2,
-    save_total_limit=2,
-    per_device_train_batch_size=8,
-    warmup_steps=10,
-    weight_decay=0.0001,
-    bf16=True,
-    logging_steps=10,
-    learning_rate=1e-5,
-    gradient_checkpointing=False,
-    # use_ipex=True,
-)
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    data_collator=default_data_collator,
-)
+    model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=torch.bfloat16)
 
-model.config.use_cache = False
-trainer.train()
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
 
-# Check model outputs
-i = random.randint(0, len(dataset["test"]))
-context = dataset["test"][i]["context"]
+    tokenizer.pad_token_id = 0
+    tokenizer.padding_side = "left"  # Allow batched inference
 
-batch = tokenizer(context, return_tensors="pt")
-batch = {k: v.to("cuda") for k, v in batch.items()}
-model.eval()
-output_tokens = model.generate(
-    **batch,
-    max_new_tokens=256,
-    do_sample=True,
-    temperature=0.2,
-    top_p=0.95,
-    top_k=50,
-    eos_token_id=tokenizer.eos_token_id,
-    pad_token_id=tokenizer.pad_token_id,
-)
-target_predicted = tokenizer.decode(output_tokens[0], skip_special_tokens=False).split("<|endcontext|>")[1]
-target = dataset["test"][i]["target"]
-print(f"{context=} \n\n {target_predicted=} \n\n {target=}")
+    config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        target_modules=lora_target_modules,
+        lora_dropout=lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, config)
+
+    if data_path.endswith(".json") or data_path.endswith(".jsonl"):
+        data = load_dataset("json", data_files=data_path)
+    else:
+        data = load_dataset(data_path)
+
+    model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
+
+    def tokenize(prompt, add_eos_token=True):
+        # there's probably a way to do this with the tokenizer settings
+        # but again, gotta move fast
+        result = tokenizer(
+            prompt,
+            truncation=True,
+            max_length=cutoff_len,
+            padding=False,
+            return_tensors=None,
+        )
+        if (
+            result["input_ids"][-1] != tokenizer.eos_token_id
+            and len(result["input_ids"]) < cutoff_len
+            and add_eos_token
+        ):
+            result["input_ids"].append(tokenizer.eos_token_id)
+            result["attention_mask"].append(1)
+
+        result["labels"] = result["input_ids"].copy()
+
+        return result
+
+    def generate_and_tokenize_prompt(data_point):
+        full_prompt = prompter.generate_prompt(
+            data_point["instruction"],
+            data_point["input"],
+            data_point["output"],
+        )
+        tokenized_full_prompt = tokenize(full_prompt)
+        if not train_on_inputs:
+            user_prompt = prompter.generate_prompt(
+                data_point["instruction"], data_point["input"]
+            )
+            tokenized_user_prompt = tokenize(
+                user_prompt, add_eos_token=add_eos_token
+            )
+            user_prompt_len = len(tokenized_user_prompt["input_ids"])
+
+            if add_eos_token:
+                user_prompt_len -= 1
+
+            tokenized_full_prompt["labels"] = [
+                -100
+            ] * user_prompt_len + tokenized_full_prompt["labels"][
+                user_prompt_len:
+            ]  # could be sped up, probably
+        return tokenized_full_prompt
+
+    if val_set_size > 0:
+        train_val = data["train"].train_test_split(
+            test_size=val_set_size, shuffle=True, seed=42
+        )
+        train_data = (
+            train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+        )
+        val_data = (
+            train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+        )
+    else:
+        train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
+        val_data = None
+
+    if not ddp and torch.cuda.device_count() > 1:
+        # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
+        model.is_parallelizable = True
+        model.model_parallel = True
+
+    trainer = transformers.Trainer(
+        model=model,
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        args=transformers.TrainingArguments(
+            per_device_train_batch_size=micro_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            warmup_steps=100,
+            num_train_epochs=num_epochs,
+            learning_rate=learning_rate,
+            bf16=True,
+            logging_steps=10,
+            optim="adamw_torch",
+            evaluation_strategy="steps" if val_set_size > 0 else "no",
+            save_strategy="steps",
+            eval_steps=200 if val_set_size > 0 else None,
+            save_steps=200,
+            output_dir=output_dir,
+            save_total_limit=3,
+            load_best_model_at_end=True if val_set_size > 0 else False,
+            ddp_find_unused_parameters=False if ddp else None,
+            group_by_length=group_by_length,
+        ),
+        data_collator=transformers.DataCollatorForSeq2Seq(
+            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+        ),
+    )
+
+    model.config.use_cache = False
+    trainer.train()
+    model.save_pretrained(output_dir)
+
+
+if __name__ == "__main__":
+    fire.Fire(train)
